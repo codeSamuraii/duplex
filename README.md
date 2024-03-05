@@ -18,13 +18,15 @@ host, port = await duplex.connect(host='127.0.0.1', port=8888)
 print(f"Connected to {host}:{port} !")
 ```
 
-Once connected, you can exchange message with the queues :
+Once connected, you can exchange message with the returned queues :
 ```python
 await send_queue.put(b'Hi !')
 msg = await recv_queue.get()
 ```
 
-Of course, we can automate that asynchronously with `asyncio`:
+You can provide existing queue objects to be used in `Duplex.new()`. Otherwise, they will be created.
+
+Of course, we can automate all that asynchronously with `asyncio`:
 ```python
 async def get_and_print(recv_queue):
     """Get messages from the inbox and print them."""
@@ -57,6 +59,8 @@ async def main():
 The `duplex.disconnected` future can be awaited to execute until connection is closed or interrupted.
 In that situation, the inbox/receive queue will get a `None` item to notify consumers should return.
 
-`await duplex.connected`/`duplex.is_running()` can be used to wait for a connection to be established.
+Similarly, `await duplex.connected` / `duplex.is_running()` can be used to wait for a connection to be established.
 
-Methods can be used asynchronously or sequentially: `await duplex.closing()`/`duplex.close()`, `await duplex.aborting()`/`duplex.abort()`.
+Other methods:
+- `await duplex.closing()` / `duplex.close()`,
+- `await duplex.aborting()` / `duplex.abort()`.
