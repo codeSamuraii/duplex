@@ -1,245 +1,133 @@
-import re
-import socket
+import asyncio
 import logging
-import eventlet
 
-from tools import *
-
-log = configure_logging('Duplex')
+log = logging.getLogger('Duplex')
 
 
-class DuplexAPI:
-    def __new__(cls):
-        eventlet_routine()
-        return object.__new__(cls)
+class DuplexProtocol(asyncio.Protocol):
 
-    def __init__(self):
-        self._job = None
-        self._sock = None
-        self._regex = None
-        self._running = None
-        self._last_exc = None
-        self._buffer = bytearray()
+    def __init__(self, inbox: asyncio.Queue):
+        self.inbox = inbox
+        self.transport = None
+
+        self.connected = asyncio.Future()
+        self.disconnected = asyncio.Future()
     
-        self._pool = eventlet.GreenPool()
-        self._recv_queue = eventlet.Queue()
-        self._send_queue = eventlet.Queue()
+    async def get_transport(self):
+        await self.connected
+        return self.transport
 
-        if type(self) is DuplexAPI:
-            raise NotImplementedError("DuplexAPI is not meant to be instanciated, use the Duplex class.")
+    def connection_made(self, transport):
+        self.transport = transport
+        self.connected.set_result(transport.get_extra_info('peername'))
+    
+    def data_received(self, data):
+        self.inbox.put_nowait(data)
 
-    def _pack_msg(self, msg: bytes):
-        return b'%START%' + msg + b'%STOP%'
-
-    def _unpack_msg(self, data: bytes):
-        if self._regex is None:
-            self._regex = re.compile(b'%START%(.*?)%STOP%', flags=re.DOTALL)
-
-        messages = self._regex.findall(data)
-        remainder = self._regex.sub(b'', data)
-        return messages, remainder
+    def eof_received(self):
+        self.inbox.put_nowait(None)
+        self.transport.close()
     
-    def _reset_buffer(self, data: bytes):
-        self._buffer.clear()
-        self._buffer.extend(data)
-    
-    def _recv_to_buffer(self):
-        while True:
-            try:
-                chunk = self._sock.recv(4096)
-            except socket.error:
-                # Non-blocking socket, no data available.
-                break
-
-            if chunk:
-                self._buffer.extend(chunk)
-            else:
-                self._notify_disconnected()
-                break
-
-    def _recv_msg(self):
-        self._recv_to_buffer()
-        messages, remainder = self._unpack_msg(self._buffer)
-        self._reset_buffer(remainder)
-        return messages
-    
-    def _send_msg(self, msg: bytes):
-        packet = self._pack_msg(msg)
-        self._sock.sendall(packet)
-
-    def _send_items_in_queue(self):
-        if not self._send_queue.empty():
-            try:
-                packet = self._send_queue.get(timeout=2)
-            except eventlet.queue.Empty:
-                log.warning("Couldn't fetch item from queue.")
-            else:
-                self._send_msg(packet)
-                
-    def _receive_and_put_in_queue(self):
-        for msg in self._recv_msg():
-            try:
-                self._recv_queue.put(msg, timeout=2)
-            except eventlet.queue.Full:
-                log.warning(f"Couldn't put item in queue.")
-    
-    def _loop_running(self):
-        return self._running is True
-
-    def _stop_loop(self):
-        self._running = False
-    
-    def _exchange_messages(self):
-        while self._loop_running():
-            self._send_items_in_queue()
-            self._receive_and_put_in_queue()
-            eventlet.sleep()
-    
-    def _notify_disconnected(self):
-        log.debug("Peer disconnected.")
-        self.stop(exception=socket.error("Other side disconnected."))
-    
-    def _kill_job(self):
-        if self._job is not None:
-            self._job.kill()
-        if self._sock is not None:
-            self._sock.close()
-    
-    def _handle_exception(self, raise_exc: bool = True):
-        if self._last_exc is None:
+    def connection_lost(self, exception):
+        if self.disconnected.done():
             return
-        
-        last_exc = self._last_exc
-        
-        if raise_exc:
-            self._last_exc = None
-            raise last_exc
-        else:
-            log.exception("Duplex stopped due to an exception.", exc_info=last_exc)
-    
-    def _get(self, block: bool = True, timeout: int | None = None):
-        msg = self._recv_queue.get(block=block, timeout=timeout)
-        return msg
-    
-    def _get_safe(self):
-        while True:
-            try:
-                msg = self._get(block=False, timeout=1)
-                return msg
-            except eventlet.queue.Empty:
-                pass
-            
-            if not self._loop_running():
-                log.error("Can't receive message, duplex interrupted.")
-                return b''
-            
-            eventlet.sleep()
-    
-    def _put(self, *args, **kwargs):
-        self._send_queue.put(*args, **kwargs)
-    
-    def __del__(self):
-        self.close(raise_exc=False)
 
-
-class Duplex(DuplexAPI):
+        if not self.transport.is_closing():
+            self.transport.close()
     
-    def listen(self, port: int, *, host: str):
-        """Wait for a connection on the given port and host."""
-        server = socket.create_server((host, port))
-        server.listen(0)
-        log.info(f"Listening on %s:%d.", host, port)
-
-        self._sock, peer = server.accept()
-        self._sock.setblocking(False)
-        log.info(f"Connection from %s accepted.", peer[0])
-    
-    def connect(self, host: str, port: int):
-        """Connect to the given host and port."""
-        self._sock = socket.create_connection((host, port))
-        self._sock.setblocking(False)
-        log.info(f"Connected to %s:%d.", host, port)
-    
-    def start(self):
-        """Start the message exchange loop."""
-        self._running = True
-        self._job = self._pool.spawn(self._exchange_messages)
-        log.debug("Message exchange job started.")
-    
-    def stop(self, exception: Exception | None = None):
-        """Stop the message exchange loop."""
-        if self._loop_running():
-            self._stop_loop()
-            log.debug("Message exchange loop stopped.")
-
         if exception is not None:
-            self._last_exc = exception
-    
-    def close(self, raise_exc: bool = True):
-        """Wait for everything to be closed, raise an exception if there was an error by default."""
-        if self._loop_running():
-            self.stop()
+            self.disconnected.set_exception(exception)
+        else:
+            self.disconnected.set_result(None)
 
-        self._kill_job()
-        self._pool.waitall()
-        self._handle_exception(raise_exc)
 
-    def receive(self, timeout: int | None = None):
-        """
-        Wait for an incoming message.
-        If `timeout` is 0, return directly with a message if available or raise `eventlet.queue.Empty`.
-        If `timeout` is a positive integer, wait that many seconds for a message, before raising `eventlet.queue.Empty`.
-        If `timeout` is None or not specified, block until a message is received. This method *will* return early in case of error.
-        """
-        if not self._loop_running():
-            self.close()
+class Duplex:
+    def __init__(self, inbox: asyncio.Queue, outbox: asyncio.Queue, *args):
+        self.inbox = inbox
+        self.outbox = outbox
+        self.transport = None
+        self.protocol = None
+        self.send_job = None
+
+        if ... not in args:
+            raise NotImplementedError("Duplex should be instanciated with `new()`.")
     
-        if timeout is None:
-            return self._get_safe()
-        return self._get(block=True, timeout=timeout)
+    @property
+    def connected(self):
+        """Resolves with (host, port) when the connection is established."""
+        return self.protocol.connected
     
-    def send(self, msg: bytes, notify_cb: callable = None):
-        """Put a message in the send queue."""
-        if not self._loop_running():
-            self.close()
-        
-        self._put(msg)
+    @property
+    def disconnected(self):
+        """Resolves when the connection is closed or lost. Raises if an error occurred."""
+        return self.protocol.disconnected
     
-    def set_logging_level(self, level: int):
-        log.setLevel(level)
+    def is_running(self):
+        """Check if connected and exchanging data."""
+        started = self.protocol.connected.done() and self.transport is not None
+        ended = self.protocol.disconnected.done() or self.transport.is_closing()
+        return started and not ended
+
+    def close(self):
+        """Close the connection."""
+        self.transport.close()
+    
+    async def closing(self):
+        """Wait for the connection to close."""
+        self.close()
+        return await self.disconnected
+    
+    def abort(self):
+        """Interrupt the connection without notifying or cleaning up."""
+        self.transport.abort()
+
+    async def aborting(self):
+        """Wait for the connection to be interrupted."""
+        self.abort()
+        return await self.disconnected 
+
+    async def _send_job(self):
+        await self.connected
+        try:
+            await self._send_loop()
+        except Exception as e:
+            log.error(e)
+            self.protocol.disconnected.set_exception(e)
+
+    async def _send_loop(self):
+        await self.connected
+        while self.is_running():
+            data = await self.outbox.get()
+            self.transport.write(data)
 
     @classmethod
-    def connect_to(cls, host: str = '127.0.0.1', port: int = 8765, verbose: bool = False):
-        """Create a Duplex client connected to the given host and port."""
-        duplex = cls()
-        if verbose: duplex.set_logging_level(logging.DEBUG)
-        duplex.connect(host, port)
-        duplex.start()
-        return duplex
-    
-    @classmethod
-    def listen_on(cls, host: str = '0.0.0.0', port: int = 8765, verbose: bool = False):
-        """Create a Duplex server listening on the given host and port."""
-        duplex = cls()
-        if verbose: duplex.set_logging_level(logging.DEBUG)
-        duplex.listen(port, host=host)
-        duplex.start()
-        return duplex
-    
-
-    @classmethod
-    @make_awaitable
-    def listen_wait(cls, host: str = '0.0.0.0', port: int = 8765, verbose: bool = False):
-        """Create a Duplex server and wait for a connection on given host and port."""
-        return cls.listen_on(host, port, verbose)
-
-    @make_awaitable
-    def wait_for_message(self, timeout: int | None = None):
+    def new(cls, inbox: asyncio.Queue | None = None, outbox: asyncio.Queue | None = None):
         """
-        Wait for an incoming message.
-        If `timeout` is 0, return directly with a message if available or raise `eventlet.queue.Empty`.
-        If `timeout` is a positive integer, wait that many seconds for a message, before raising `eventlet.queue.Empty`.
-        If `timeout` is None or not specified, block until a message is received. This method *will* still return early in case of error.
+        Create a new Duplex instance.
+        Will use provided queues or create new ones if not provided.
         """
-        return self.receive(timeout=timeout)
+        recv_queue = inbox or asyncio.Queue()
+        send_queue = outbox or asyncio.Queue()
+        duplex = cls(recv_queue, send_queue, ...)
+        return duplex, duplex.inbox, duplex.outbox
+    
+    async def connect(self, host: str = '127.0.0.1', port: int = 8765):
+        """Connect to a Duplex server."""
+        self.protocol = DuplexProtocol(self.inbox)
+        loop = asyncio.get_running_loop()
 
+        self.transport, _ = await loop.create_connection(lambda: self.protocol, host, port)
+
+        self.send_job = loop.create_task(self._send_job())
+        return await self.connected
+    
+    async def listen(self, host: str = '0.0.0.0', port: int = 8765):
+        """Listen for incoming connections."""
+        self.protocol = DuplexProtocol(self.inbox)
+        loop = asyncio.get_running_loop()
+
+        await loop.create_server(lambda: self.protocol, host, port)
+        self.transport = await self.protocol.get_transport()
+
+        self.send_job = loop.create_task(self._send_job())
+        return await self.connected

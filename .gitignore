@@ -1,1 +1,5 @@
 /Pipfile.lock
+tests/
+client.py
+server.py
+*.old.py

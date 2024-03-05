@@ -1,20 +1,18 @@
-import socket
-import logging
 import eventlet
+import logging
 import asyncio
 from functools import wraps, partial
-from eventlet import debug as eventlet_debug
 
-log = logging.getLogger('Duplex.misc')
+log = logging.getLogger('Duplex')
 
 
 def eventlet_routine():
     """Patch imports and disable multiple readers warnings."""
-    log.debug("> Entering eventlet routine.")
-
-    if not eventlet.patcher.is_monkey_patched(socket):
+    if not eventlet.patcher.is_monkey_patched('socket'):
         log.debug("Patching imports...")
         eventlet.monkey_patch()
+
+        from eventlet import debug as eventlet_debug
         eventlet_debug.hub_prevent_multiple_readers(False)
     else:
         log.debug("All modules patched.")
