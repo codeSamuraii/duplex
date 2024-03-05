@@ -1,5 +1,5 @@
 # Duplex
-Python module to easily create a socket communication channel with a `Queue` API.
+Python [asyncio](https://docs.python.org/3/library/asyncio.html) module to easily create a socket communication channel with a [queue](https://docs.python.org/3/library/asyncio-queue.html) API.
 
 Just wait for messages in the inbox/receive queue or place outgoing data in the send queue.
 
